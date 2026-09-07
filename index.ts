@@ -8,6 +8,7 @@ import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
 
 import { audit, overlaps } from "./audit";
+import { fluxLines, startFluxTap, stopFluxTap } from "./flux";
 import { covering, layout, react, selectors, vars, winners } from "./inspect";
 import { restLines, startTap, stopTap } from "./rest";
 import { costLines, diffLines, findLines, patchLines, regexLines, storeLines } from "./tools";
@@ -96,9 +97,9 @@ function startCollectors() {
 // ------------------------------------------------------------------ lenses
 
 type Lens = "perf" | "boot" | "tasks" | "churn" | "inspect" | "css" | "audit"
-    | "find" | "regex" | "rest" | "patches" | "stores" | "cost" | "diff";
+    | "find" | "regex" | "rest" | "flux" | "patches" | "stores" | "cost" | "diff";
 const LENSES: Lens[] = ["perf", "boot", "tasks", "churn", "inspect", "css", "audit",
-    "find", "regex", "rest", "patches", "stores", "cost", "diff"];
+    "find", "regex", "rest", "flux", "patches", "stores", "cost", "diff"];
 let lens: Lens = "perf";
 
 let frames: number[] = [];
@@ -281,6 +282,7 @@ function typedLines(which: Lens): string[] {
         case "cost": return cached(`cost:${q}`, () => costLines(q));
         case "css": return cssLines(q);
         case "rest": return restLines(q);
+        case "flux": return fluxLines(q);
         case "patches": return cached("patches", () => patchLines());
         case "diff": return cached("diff", () => diffLines(MILESTONES));
         default: return [];
@@ -293,8 +295,9 @@ const PROMPTS: Partial<Record<Lens, string>> = {
     find: "words a module must all contain",
     regex: "<find> | <regex> | <replacement, optional>",
     rest: "filter by method or path",
+    flux: "part of an event name",
     stores: "part of a store name",
-    cost: "a css selector"
+    cost: "a css selector, or leave it empty to rank every rule"
 };
 
 const SCRATCH_ID = "probe-deck-scratch";
@@ -906,12 +909,14 @@ export default definePlugin({
     start() {
         startCollectors();
         startTap();
+        startFluxTap();
         window.addEventListener("keydown", onKey, true);
         if (settings.store.openOnStart) setTimeout(open, 3000);
     },
 
     stop() {
         stopTap();
+        stopFluxTap();
         window.removeEventListener("keydown", onKey, true);
         taskObs?.disconnect();
         msObs?.disconnect();

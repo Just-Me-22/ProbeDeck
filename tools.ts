@@ -272,20 +272,107 @@ function chunk(items: string[], perRow: number): string[] {
     return rows;
 }
 
-export function costLines(query: string): string[] {
-    if (!query.trim()) {
-        return [
-            "paste a css selector to see what it costs before you ship it.",
-            "",
-            "reports how many elements it matches and how long the browser takes",
-            "to run it, plus the parts that make a selector expensive on a hover",
-            "or scroll path.",
-            "",
-            "example",
-            "  :root:has(#vc-spotify-player)",
-            "  [class*=\"panels_\"] [class*=\"container_\"]"
-        ];
+/** cheap triage, so the sweep only pays to time the selectors that could be slow */
+function smell(sel: string): number {
+    let score = 0;
+    if (sel.includes(":has(")) score += 40;
+    if (/\[class\*=/.test(sel)) score += 8;
+    if (/\[[^\]]*\*=/.test(sel)) score += 6;
+    if (sel.includes("*")) score += 10;
+
+    const depth = sel.trim().split(/\s+/).filter(p => p !== ">" && p !== "+" && p !== "~").length;
+    if (depth >= 4) score += depth * 2;
+    if (/:(hover|focus|active|not|is|where)\b/.test(sel)) score += 3;
+
+    return score;
+}
+
+/** every selector the page has loaded, with the sheet it came from */
+function allSelectors(): { sel: string; from: string; }[] {
+    const out: { sel: string; from: string; }[] = [];
+    const seen = new Set<string>();
+
+    for (const sheet of Array.from(document.styleSheets)) {
+        let rules: CSSRuleList;
+        try {
+            rules = sheet.cssRules;
+        } catch {
+            continue;
+        }
+
+        const node = sheet.ownerNode as HTMLElement | null;
+        const from = sheet.href
+            ? sheet.href.split("/").pop()!.slice(0, 28)
+            : node?.id || node?.className || "inline style";
+
+        const walk = (list: CSSRuleList) => {
+            for (const rule of Array.from(list)) {
+                const nested = (rule as CSSGroupingRule).cssRules;
+                if (nested) { walk(nested); continue; }
+
+                const selector = (rule as CSSStyleRule).selectorText;
+                if (!selector) continue;
+
+                for (const part of selector.split(",")) {
+                    const sel = part.trim();
+                    if (!sel || seen.has(sel)) continue;
+                    seen.add(sel);
+                    out.push({ sel, from: String(from) });
+                }
+            }
+        };
+        walk(rules);
     }
+
+    return out;
+}
+
+function sweepLines(): string[] {
+    const all = allSelectors();
+    if (!all.length) return ["no stylesheet could be read, so there is nothing to rank"];
+
+    // time only the worst smelling ones: timing thousands of selectors would itself
+    // be the slowest thing on the page
+    const suspects = all
+        .map(entry => ({ ...entry, score: smell(entry.sel) }))
+        .filter(entry => entry.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 40);
+
+    const runs = 60;
+    const timed = suspects.map(entry => {
+        let each = 0;
+        let count = 0;
+        try {
+            count = document.querySelectorAll(entry.sel).length;
+            const t0 = performance.now();
+            for (let i = 0; i < runs; i++) document.querySelectorAll(entry.sel);
+            each = (performance.now() - t0) / runs;
+        } catch {
+            each = -1;
+        }
+        return { ...entry, each, count };
+    }).sort((a, b) => b.each - a.each);
+
+    const total = timed.reduce((sum, e) => sum + Math.max(0, e.each), 0);
+
+    return [
+        `${all.length} selectors loaded, ${suspects.length} timed`,
+        `together they cost ${total.toFixed(2)}ms per full recalc`,
+        "a frame has 16.7ms for everything, so anything near that is a problem",
+        "",
+        "type a selector to dig into one. worst first:",
+        "",
+        ...timed.map(e =>
+            `${e.each < 0 ? "  n/a" : e.each.toFixed(3).padStart(7)}ms  ${String(e.count).padStart(5)} hits  ${e.from.padEnd(20)} ${e.sel.slice(0, 60)}`),
+        "",
+        "the sheet name is where to go and fix it. :has() and [class*=] are the two",
+        "that usually account for most of the total."
+    ];
+}
+
+export function costLines(query: string): string[] {
+    if (!query.trim()) return sweepLines();
 
     const sel = query.trim();
     let count: number;
