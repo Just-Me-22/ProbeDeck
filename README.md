@@ -1,7 +1,7 @@
 # ProbeDeck
 
 A diagnostics panel that lives inside Discord, for people writing themes and plugins for
-it. Fifteen lenses, all idle until you open the panel.
+it. Seventeen lenses, all idle until you open the panel.
 
 It exists because the normal loop for this work is slow. You change a selector, rebuild,
 reload, wait fifteen seconds, and find out you guessed wrong. Most of what is here is
@@ -29,7 +29,15 @@ and right arrows.
 
 `Ctrl+Alt+P` and `Ctrl+Alt+R` still work. F keys are the better choice because they carry
 no character, so Windows never runs them through its AltGr translation and nothing can
-leak into the message box behind the panel.
+leak into the message box behind the panel. The exception is if something else on your
+machine already owns F9: dictation tools and macro apps like it, and a global hotkey wins
+before Discord ever sees the key. If pressing F9 does something unexpected, use
+`Ctrl+Alt+P`.
+
+**hold**, next to the copy button, freezes the output. `perf` and `churn` repaint twice a
+second, which makes them unreadable exactly when you are trying to read a number off
+them. Press it again for live. Switching lens always goes back to live, so you cannot end
+up staring at stale data without noticing.
 
 Drag the top bar to move it. The panel ignores the mouse everywhere else on purpose, so
 the element inspector can see through it to what you are clicking.
@@ -51,6 +59,13 @@ Underneath that is every **custom property that reaches the element**, resolved 
 point rather than globally. Most of a Discord theme lives in variables and there is
 nowhere else that shows you which ones actually arrive.
 
+Every inspect dump also carries a **contrast** reading for the clicked element: the text
+colour against whatever actually paints behind it, found by walking up past the
+transparent ancestors rather than comparing against a see-through parent and reporting
+nonsense. The threshold it checks against moves with font size and weight, so it names
+the right target and tells you how far over or under you are. This is the white text on a
+white background class of bug, caught before you ship it.
+
 **css** is a live scratchpad. Type a rule, press Ctrl+Enter, and it applies immediately.
 No build and no reload. It then reads back what the browser actually accepted and tells
 you how many elements each selector matched, which catches the two usual dead ends: a rule
@@ -70,6 +85,14 @@ is what you want after Discord ships an update and half your theme stops applyin
 ## For plugin work
 
 **find** searches every webpack module for words they must all contain.
+
+**props** is the same question `findByProps` asks. Name the properties a module has to
+expose and it lists what matches, ending with the `findByPropsLazy(...)` call ready to
+paste.
+
+**intl** goes the other way. Give it text you can see in Discord and it finds the message
+key behind it, which is what a patch has to anchor on: the key is stable across builds
+and the English is not.
 
 **regex** is a patch tester. Give it a find string and a regex and it tells you how many
 modules the find matches, how many times the regex hits in each, and what the capture
