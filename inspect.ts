@@ -162,7 +162,16 @@ export function winners(el: Element): string[] {
         out.push(`${prop.padEnd(17)}${cs.getPropertyValue(prop) || "(empty)"}`);
         out.push(`  won by  ${win.sel.slice(0, 58)}${win.important ? "  !important" : ""}`);
         out.push(`  from    ${win.src}`);
-        if (hits.length > 1) out.push(`  beat    ${hits.length - 1} other rule${hits.length > 2 ? "s" : ""}`);
+
+        // naming the rules that lost is the point: "beat 3 others" tells you a fight
+        // happened, not who you are fighting, and the loser is usually your own line
+        for (const lost of hits.slice(1, 5)) {
+            const why = lost.important === win.important
+                ? (lost.spec === win.spec ? "came earlier" : "less specific")
+                : "not important";
+            out.push(`  beat    ${lost.sel.slice(0, 48)}   ${lost.value.trim().slice(0, 20)}   ${why}`);
+        }
+        if (hits.length > 5) out.push(`  beat    and ${hits.length - 5} more`);
 
         // a var() in the winning declaration names the token to edit
         for (const token of win.value.match(/--[\w-]+/g) ?? []) {
@@ -346,5 +355,77 @@ export function selectors(el: Element): string[] {
     }
 
     out.push("", "the trailing underscore is deliberate, dropping it also matches longer names");
+    return out;
+}
+
+/** Discord themes are mostly variables, and there is nowhere in the client that shows
+ *  you which ones actually reach a given element. this walks the stylesheets for every
+ *  custom property declared on this element or anything above it, then asks the
+ *  computed style what each one resolves to here. */
+export function vars(el: Element): string[] {
+    const names = new Set<string>();
+    let blocked = 0;
+
+    const chain: Element[] = [];
+    for (let n: Element | null = el; n; n = n.parentElement) chain.push(n);
+
+    for (const sheet of Array.from(document.styleSheets)) {
+        let rules: CSSRuleList;
+        try {
+            rules = sheet.cssRules;
+        } catch {
+            blocked++;
+            continue;
+        }
+
+        for (const rule of Array.from(rules)) {
+            const styleRule = rule as CSSStyleRule;
+            const selector = styleRule.selectorText;
+            if (!selector || !styleRule.style) continue;
+
+            // :root and html reach everything, so they count without a match test
+            const global = /^\s*(:root|html)\b/.test(selector);
+            let reaches = global;
+
+            if (!reaches) {
+                for (const part of selector.split(",")) {
+                    const sel = part.trim();
+                    try {
+                        if (chain.some(node => node.matches(sel))) { reaches = true; break; }
+                    } catch { /* relative selectors the browser will not test standalone */ }
+                }
+            }
+            if (!reaches) continue;
+
+            for (let i = 0; i < styleRule.style.length; i++) {
+                const prop = styleRule.style[i];
+                if (prop.startsWith("--")) names.add(prop);
+            }
+        }
+    }
+
+    if (!names.size) {
+        return ["nothing declares a custom property that reaches this element", ...(blocked ? [`${blocked} stylesheets could not be read`] : [])];
+    }
+
+    const cs = getComputedStyle(el as HTMLElement);
+    const rows: string[] = [];
+    const empty: string[] = [];
+
+    for (const name of [...names].sort()) {
+        const value = cs.getPropertyValue(name).trim();
+        if (value) rows.push(`${name.padEnd(38)}${value}`);
+        else empty.push(name);
+    }
+
+    const out = [`${rows.length} resolve here, out of ${names.size} that reach it`, ""];
+    out.push(...rows);
+
+    if (empty.length) {
+        out.push("", `declared somewhere above but empty here: ${empty.slice(0, 12).join(", ")}${empty.length > 12 ? ` and ${empty.length - 12} more` : ""}`);
+    }
+    if (blocked) out.push("", `${blocked} stylesheets could not be read, so this may be short`);
+
+    out.push("", "paste one into the css lens to try a different value without a rebuild");
     return out;
 }

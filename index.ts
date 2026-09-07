@@ -8,7 +8,7 @@ import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
 
 import { audit, overlaps } from "./audit";
-import { covering, layout, react, selectors, winners } from "./inspect";
+import { covering, layout, react, selectors, vars, winners } from "./inspect";
 import { restLines, startTap, stopTap } from "./rest";
 import { costLines, diffLines, findLines, patchLines, regexLines, storeLines } from "./tools";
 
@@ -442,6 +442,8 @@ function onInspectClick(e: MouseEvent) {
         ...chain,
         ...rule("SELECTORS  (paste one of these straight into the theme)"),
         ...selectors(el),
+        ...rule("VARIABLES  (every custom property that reaches this element)"),
+        ...vars(el),
         ...rule("LAYOUT  (how the parent is placing it)"),
         ...layout(el),
         ...rule("WINNING RULES  (what is actually setting each property)"),
