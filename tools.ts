@@ -449,3 +449,90 @@ export function diffLines(milestones: [string, string][]): string[] {
         "'since you last looked'. a CHANGED row is a class name to fix in the registry."
     ];
 }
+
+/** every module exposing all of these property names, which is the same question
+ *  findByProps answers, without having to guess in the console */
+export function propsLines(query: string): string[] {
+    const wanted = query.split(/[\s,]+/).map(w => w.trim()).filter(Boolean);
+    if (!wanted.length) {
+        return [
+            "list property names a module must all have, space separated.",
+            "",
+            "the same question findByProps answers, so whatever this finds is what",
+            "findByPropsLazy will hand you at runtime.",
+            "",
+            "example",
+            "  open selectRole updateGuild",
+            "  getMemberCount"
+        ];
+    }
+
+    const hits: string[] = [];
+    for (const id of Object.keys(wreq.m)) {
+        let exports: any;
+        try {
+            exports = wreq(id as any);
+        } catch {
+            continue;
+        }
+        if (exports == null || (typeof exports !== "object" && typeof exports !== "function")) continue;
+
+        const check = (obj: any, path: string) => {
+            try {
+                if (wanted.every(w => obj[w] !== undefined)) hits.push(`${id}${path}`);
+            } catch { /* getters that throw when read out of context */ }
+        };
+
+        check(exports, "");
+        for (const key of Object.keys(exports).slice(0, 40)) {
+            const inner = exports[key];
+            if (inner && (typeof inner === "object" || typeof inner === "function")) check(inner, `.${key}`);
+        }
+        if (hits.length > 30) break;
+    }
+
+    if (!hits.length) return [`nothing exposes all of: ${wanted.join(", ")}`];
+
+    return [
+        `${hits.length} match${hits.length > 1 ? "es" : ""} for: ${wanted.join(", ")}`,
+        "",
+        ...hits,
+        "",
+        `findByPropsLazy(${wanted.map(w => JSON.stringify(w)).join(", ")})`
+    ];
+}
+
+/** Discord holds its copy in one big map. finding the key for text on screen is
+ *  what you need when a patch has to match on a string. */
+export function intlLines(query: string): string[] {
+    const wanted = query.trim().toLowerCase();
+    if (!wanted) {
+        return [
+            "type words you can see in discord to find the key behind them.",
+            "",
+            "useful when a patch has to anchor on a message, since the key is stable",
+            "and the english text is not.",
+            "",
+            "example",
+            "  members",
+            "  are you sure"
+        ];
+    }
+
+    const found: string[] = [];
+    for (const id of Object.keys(wreq.m)) {
+        const src = source(id);
+        if (!src.includes("intl") && !src.includes("Messages")) continue;
+
+        for (const m of src.matchAll(/["'`]([A-Z0-9_]{6,})["'`]\s*:\s*["'`]([^"'`]{3,120})["'`]/g)) {
+            if (m[2].toLowerCase().includes(wanted)) {
+                found.push(`${m[1]}\n    ${m[2]}`);
+                if (found.length > 40) break;
+            }
+        }
+        if (found.length > 40) break;
+    }
+
+    if (!found.length) return [`no message contains "${query.trim()}"`];
+    return [`${found.length} message${found.length > 1 ? "s" : ""} containing "${query.trim()}"`, "", ...found];
+}

@@ -501,3 +501,50 @@ function describeShort(el: Element): string {
     const cls = typeof el.className === "string" ? el.className.split(/\s+/).slice(0, 2).join(" ") : "";
     return `${el.tagName.toLowerCase()}  ${cls}`.trim();
 }
+
+const channel = (v: number) => v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+
+function luminance(rgb: string): number | null {
+    const parts = rgb.match(/[\d.]+/g);
+    if (!parts || parts.length < 3) return null;
+
+    const [r, g, b] = parts.slice(0, 3).map(n => channel(Number(n) / 255));
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/** the first ancestor that actually paints something, since most elements are
+ *  transparent and comparing text against transparent tells you nothing */
+function paintedBehind(el: Element): string {
+    for (let n: Element | null = el; n; n = n.parentElement) {
+        const bg = getComputedStyle(n as HTMLElement).backgroundColor;
+        if (bg && !/rgba?\([^)]*,\s*0\)$/.test(bg) && bg !== "transparent") return bg;
+    }
+    return "rgb(0, 0, 0)";
+}
+
+export function contrast(el: Element): string[] {
+    const cs = getComputedStyle(el as HTMLElement);
+    const fg = cs.color;
+    const bg = paintedBehind(el);
+
+    const lf = luminance(fg);
+    const lb = luminance(bg);
+    if (lf == null || lb == null) return ["could not read a colour off this element"];
+
+    const ratio = (Math.max(lf, lb) + 0.05) / (Math.min(lf, lb) + 0.05);
+    const size = parseFloat(cs.fontSize);
+    const bold = Number(cs.fontWeight) >= 700;
+    const large = size >= 24 || (size >= 18.66 && bold);
+    const need = large ? 3 : 4.5;
+
+    return [
+        `text        ${fg}`,
+        `behind it   ${bg}`,
+        `ratio       ${ratio.toFixed(2)} to 1`,
+        `needs       ${need} for ${large ? "large" : "normal"} text at ${size}px${bold ? " bold" : ""}`,
+        "",
+        ratio >= need
+            ? `passes, with ${(ratio - need).toFixed(2)} to spare`
+            : `FAILS by ${(need - ratio).toFixed(2)}. this is the white on white class of bug.`
+    ];
+}

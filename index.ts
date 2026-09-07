@@ -9,9 +9,9 @@ import definePlugin, { OptionType } from "@utils/types";
 
 import { audit, overlaps } from "./audit";
 import { fluxLines, startFluxTap, stopFluxTap } from "./flux";
-import { compare, covering, layout, react, selectors, vars, winners } from "./inspect";
+import { compare, contrast, covering, layout, react, selectors, vars, winners } from "./inspect";
 import { restLines, startTap, stopTap } from "./rest";
-import { costLines, diffLines, findLines, patchLines, regexLines, storeLines } from "./tools";
+import { costLines, diffLines, findLines, intlLines, patchLines, propsLines, regexLines, storeLines } from "./tools";
 
 const PANEL_ID = "probe-deck";
 
@@ -97,9 +97,9 @@ function startCollectors() {
 // ------------------------------------------------------------------ lenses
 
 type Lens = "perf" | "boot" | "tasks" | "churn" | "inspect" | "css" | "audit"
-    | "find" | "regex" | "rest" | "flux" | "patches" | "stores" | "cost" | "diff";
+    | "find" | "props" | "intl" | "regex" | "rest" | "flux" | "patches" | "stores" | "cost" | "diff";
 const LENSES: Lens[] = ["perf", "boot", "tasks", "churn", "inspect", "css", "audit",
-    "find", "regex", "rest", "flux", "patches", "stores", "cost", "diff"];
+    "find", "props", "intl", "regex", "rest", "flux", "patches", "stores", "cost", "diff"];
 let lens: Lens = "perf";
 
 let frames: number[] = [];
@@ -290,6 +290,8 @@ function typedLines(which: Lens): string[] {
         case "stores": return cached(`stores:${q}`, () => storeLines(q));
         case "cost": return cached(`cost:${q}`, () => costLines(q));
         case "css": return cssLines(q);
+        case "props": return cached(`props:${q}`, () => propsLines(q));
+        case "intl": return cached(`intl:${q}`, () => intlLines(q));
         case "rest": return restLines(q);
         case "flux": return fluxLines(q);
         case "patches": return cached("patches", () => patchLines());
@@ -302,6 +304,8 @@ function typedLines(which: Lens): string[] {
 const PROMPTS: Partial<Record<Lens, string>> = {
     css: "css to try, applied the moment you press ctrl+enter",
     find: "words a module must all contain",
+    props: "property names a module must all have",
+    intl: "words you can see on screen",
     regex: "<find> | <regex> | <replacement, optional>",
     rest: "filter by method or path",
     flux: "part of an event name",
@@ -460,6 +464,8 @@ function onInspectClick(e: MouseEvent) {
         ...chain,
         ...rule("SELECTORS  (paste one of these straight into the theme)"),
         ...selectors(el),
+        ...rule("CONTRAST  (text against whatever actually paints behind it)"),
+        ...contrast(el),
         ...rule("VARIABLES  (every custom property that reaches this element)"),
         ...vars(el),
         ...rule("LAYOUT  (how the parent is placing it)"),
@@ -632,6 +638,19 @@ function chromeEl(): HTMLElement {
         `border:1px solid ${INK.line};border-radius:3px;font:inherit;font-weight:600;background:transparent;color:${INK.dim}`;
     copy.addEventListener("pointerdown", e => e.stopPropagation());
     copy.addEventListener("click", e => { e.stopPropagation(); copyPanel(); });
+
+    const hold = document.createElement("button");
+    hold.className = "pd-copy";
+    hold.textContent = frozen ? "live" : "hold";
+    hold.style.cssText = copy.style.cssText;
+    hold.addEventListener("pointerdown", e => e.stopPropagation());
+    hold.addEventListener("click", e => {
+        e.stopPropagation();
+        frozen = frozen ? null : bodyOf();
+        lastPaint = "";
+        render();
+    });
+    bar.appendChild(hold);
     bar.appendChild(copy);
 
     const keys = document.createElement("span");
@@ -760,17 +779,20 @@ function panel(): HTMLElement {
     return el;
 }
 
-function render() {
-    const el = document.getElementById(PANEL_ID);
-    if (!el) return;
-    const body =
-        lens === "perf" ? perfLines() :
+function bodyOf(): string[] {
+    return lens === "perf" ? perfLines() :
         lens === "boot" ? bootLines() :
         lens === "tasks" ? taskLines() :
         lens === "churn" ? churnLines() :
         lens === "audit" ? auditLines() :
         lens === "inspect" ? inspectLines :
-        typedLines(lens);
+            typedLines(lens);
+}
+
+function render() {
+    const el = document.getElementById(PANEL_ID);
+    if (!el) return;
+    const body = frozen ?? bodyOf();
     lastText = [
         `PROBE DECK  [${LENSES.map(l => (l === lens ? `(${l})` : l)).join(" ")}]`,
         "left/right arrow lens   ctrl+alt+p hide   ctrl+alt+r reset   copy button in the header",
@@ -803,6 +825,9 @@ function onWheel(e: WheelEvent) {
 let lastText = "";
 let lastPaint = "";
 let copyNote = "";
+/** perf and churn repaint twice a second, which makes them unreadable while you are
+ *  trying to look at a number. this holds whatever was on screen. */
+let frozen: string[] | null = null;
 
 /** the panel is pointer-events:none so it cannot be selected. this is the only way
  *  its output leaves the client, and reading it off a screenshot does not work -
@@ -849,6 +874,7 @@ function close() {
 const isOpen = () => !!document.getElementById(PANEL_ID);
 
 function show(next: Lens) {
+    frozen = null;
     lens = next;
     lens === "churn" ? startChurn() : stopChurn();
     pendingFocus = PROMPTS[lens] != null;
