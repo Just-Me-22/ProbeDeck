@@ -429,3 +429,75 @@ export function vars(el: Element): string[] {
     out.push("", "paste one into the css lens to try a different value without a rebuild");
     return out;
 }
+
+/** box and layout first, because that is what people are actually asking about when
+ *  two things that should look the same do not */
+const DIFF_FIRST = [
+    "display", "position", "width", "height", "min-width", "min-height",
+    "max-width", "max-height", "flex", "flex-grow", "flex-shrink", "flex-basis",
+    "align-self", "order", "margin-top", "margin-bottom", "margin-left", "margin-right",
+    "padding-top", "padding-bottom", "padding-left", "padding-right",
+    "font-size", "font-weight", "line-height", "color", "background-color",
+    "opacity", "transform", "overflow", "z-index"
+];
+
+const SKIP = /^(--|perspective-origin|transform-origin|-webkit-)/;
+
+/** every class one has and the other does not, which is often the whole answer */
+function classDiff(a: Element, b: Element) {
+    const left = [...a.classList];
+    const right = [...b.classList];
+    return {
+        onlyA: left.filter(c => !right.includes(c)),
+        onlyB: right.filter(c => !left.includes(c))
+    };
+}
+
+export function compare(a: Element, b: Element): string[] {
+    const ca = getComputedStyle(a as HTMLElement);
+    const cb = getComputedStyle(b as HTMLElement);
+
+    const differing: [string, string, string][] = [];
+    for (let i = 0; i < ca.length; i++) {
+        const prop = ca[i];
+        if (SKIP.test(prop)) continue;
+
+        const va = ca.getPropertyValue(prop);
+        const vb = cb.getPropertyValue(prop);
+        if (va !== vb) differing.push([prop, va, vb]);
+    }
+
+    differing.sort((x, y) => {
+        const ix = DIFF_FIRST.indexOf(x[0]);
+        const iy = DIFF_FIRST.indexOf(y[0]);
+        if (ix !== iy) return (ix < 0 ? 999 : ix) - (iy < 0 ? 999 : iy);
+        return x[0].localeCompare(y[0]);
+    });
+
+    const { onlyA, onlyB } = classDiff(a, b);
+    const out: string[] = [];
+
+    out.push("first click   " + (describeShort(a) || "(no classes)"));
+    out.push("second click  " + (describeShort(b) || "(no classes)"), "");
+
+    if (onlyA.length || onlyB.length) {
+        if (onlyA.length) out.push(`only on the first    ${onlyA.join(" ")}`);
+        if (onlyB.length) out.push(`only on the second   ${onlyB.join(" ")}`);
+        out.push("");
+    }
+
+    if (!differing.length) return [...out, "every computed property matches, so the difference is not in css"];
+
+    out.push(`${differing.length} computed properties differ, box and layout first`, "");
+    for (const [prop, va, vb] of differing.slice(0, 60)) {
+        out.push(`${prop.padEnd(24)}${va.slice(0, 22).padEnd(24)}${vb.slice(0, 22)}`);
+    }
+    if (differing.length > 60) out.push("", `and ${differing.length - 60} more`);
+
+    return out;
+}
+
+function describeShort(el: Element): string {
+    const cls = typeof el.className === "string" ? el.className.split(/\s+/).slice(0, 2).join(" ") : "";
+    return `${el.tagName.toLowerCase()}  ${cls}`.trim();
+}

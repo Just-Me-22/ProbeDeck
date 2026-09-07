@@ -9,7 +9,7 @@ import definePlugin, { OptionType } from "@utils/types";
 
 import { audit, overlaps } from "./audit";
 import { fluxLines, startFluxTap, stopFluxTap } from "./flux";
-import { covering, layout, react, selectors, vars, winners } from "./inspect";
+import { compare, covering, layout, react, selectors, vars, winners } from "./inspect";
 import { restLines, startTap, stopTap } from "./rest";
 import { costLines, diffLines, findLines, patchLines, regexLines, storeLines } from "./tools";
 
@@ -104,7 +104,16 @@ let lens: Lens = "perf";
 
 let frames: number[] = [];
 let rafId = 0;
-let inspectLines: string[] = ["click any element to dump its box chain", "", "its own subtree prints below every click"];
+let inspectLines: string[] = [
+    "click any element to dump its box chain",
+    "",
+    "its own subtree prints below every click, and clicking a second element",
+    "adds a comparison against the one before it"
+];
+
+/** kept so a second click can be diffed against the first. two things that should
+ *  look the same and do not is the question this answers. */
+let previous: Element | null = null;
 
 function route(): string {
     const p = location.pathname;
@@ -440,7 +449,13 @@ function onInspectClick(e: MouseEvent) {
     }
     const rule = (title: string) => ["", "=".repeat(74), `  ${title}`, "=".repeat(74), ""];
 
+    const against = previous && previous !== el && previous.isConnected
+        ? [...rule("DIFFERENCE  (this click against the one before it)"), ...compare(previous, el)]
+        : [];
+    previous = el;
+
     inspectLines = [
+        ...against,
         ...rule("BOX CHAIN  (clicked element first, outermost last)"),
         ...chain,
         ...rule("SELECTORS  (paste one of these straight into the theme)"),
@@ -463,16 +478,21 @@ function onInspectClick(e: MouseEvent) {
 
 // ------------------------------------------------------------------- panel
 
+/** Tokyo Night, the palette this client already wears, so the panel reads as part of
+ *  the setup rather than something bolted on top of it */
 const INK = {
-    base: "#e6edf6",
-    dim: "#7d8ea6",
-    tag: "#7cd7ff",
-    cls: "#9fe6a0",
-    num: "#f3c96b",
-    str: "#f5a3c7",
-    token: "#c4a7ff",
-    warn: "#ff9b9b",
-    accent: "#8fb0ff"
+    bg: "#1a1b26",
+    line: "#2f334d",
+    base: "#c0caf5",
+    dim: "#565f89",
+    tag: "#7dcfff",
+    cls: "#9ece6a",
+    num: "#9ece6a",
+    str: "#e0af68",
+    token: "#bb9af7",
+    warn: "#f7768e",
+    accent: "#7aa2f7",
+    on: "#bb9af7"
 };
 
 // a class has to start the piece, or x=155..500 colours ".500" as one
@@ -510,7 +530,7 @@ function lineEl(text: string): HTMLElement {
 function headingEl(title: string): HTMLElement {
     const div = document.createElement("div");
     div.style.cssText = "margin:26px 0 12px;padding-bottom:6px;border-bottom:1px solid #ffffff14;" +
-        `color:${INK.dim};font-size:0.82em;font-weight:700;letter-spacing:1.6px;text-transform:uppercase`;
+        `color:${INK.dim};font-size:0.82em;font-weight:600`;
     div.textContent = title.trim();
     return div;
 }
@@ -537,11 +557,11 @@ function chip(text: Lens, active: boolean): HTMLElement {
     s.className = "pd-chip";
     // the panel is pointer-events:none so the inspect lens can see through it;
     // a tab has to opt itself back in, the way the copy button already does
-    s.style.cssText = "padding:2px 8px;border-radius:5px;font-size:0.86em;letter-spacing:0.4px;" +
+    s.style.cssText = "padding:2px 3px;font-size:0.86em;" +
         "pointer-events:auto;cursor:pointer;user-select:none;" +
         (active
-            ? "background:#4c7dff;color:#0a0d13;font-weight:700"
-            : `background:transparent;color:${INK.dim};font-weight:500`);
+            ? `color:${INK.on};font-weight:700;box-shadow:inset 0 -2px 0 ${INK.on}`
+            : `color:${INK.dim};font-weight:500`);
 
     s.addEventListener("pointerdown", e => {
         // without this the bar's drag handler starts a drag on every tab press
@@ -591,14 +611,14 @@ function chromeEl(): HTMLElement {
     const bar = document.createElement("div");
     bar.className = "pd-grip";
     bar.style.cssText = "position:sticky;top:0;z-index:1;margin:-14px -18px 14px;padding:12px 18px 11px;" +
-        "background:#0d1017;border-bottom:1px solid #ffffff1a;" +
+        `background:${INK.bg};border-bottom:1px solid ${INK.line};` +
         "pointer-events:auto;user-select:none;" +
         "display:flex;flex-wrap:wrap;align-items:center;gap:6px";
     bar.addEventListener("pointerdown", startDrag);
 
     const title = document.createElement("span");
-    title.textContent = "PROBE DECK";
-    title.style.cssText = `font-weight:700;letter-spacing:1.4px;color:${INK.accent};margin-right:4px`;
+    title.textContent = "probe deck";
+    title.style.cssText = `font-weight:600;color:${INK.accent};margin-right:6px`;
     bar.appendChild(title);
 
     for (const l of LENSES) bar.appendChild(chip(l, l === lens));
@@ -609,7 +629,7 @@ function chromeEl(): HTMLElement {
     copy.className = "pd-copy";
     copy.textContent = "copy";
     copy.style.cssText = "pointer-events:auto;cursor:pointer;margin-left:4px;padding:1px 10px;" +
-        `border:0;border-radius:999px;font:inherit;font-weight:600;background:#ffffff1a;color:${INK.base}`;
+        `border:1px solid ${INK.line};border-radius:3px;font:inherit;font-weight:600;background:transparent;color:${INK.dim}`;
     copy.addEventListener("pointerdown", e => e.stopPropagation());
     copy.addEventListener("click", e => { e.stopPropagation(); copyPanel(); });
     bar.appendChild(copy);
@@ -630,7 +650,7 @@ function chromeEl(): HTMLElement {
         box.spellcheck = false;
         box.style.cssText = "flex:0 0 100%;margin-top:8px;padding:6px 10px;pointer-events:auto;" +
             (multiline ? "min-height:84px;resize:vertical;" : "") +
-            `border:1px solid #ffffff26;border-radius:7px;font:inherit;background:#ffffff0d;color:${INK.base};outline:none`;
+            `border:1px solid ${INK.line};border-radius:3px;font:inherit;background:#16161e;color:${INK.base};outline:none`;
 
         // the arrows change lens and discord's composer eats the rest, so while this
         // has focus every key belongs to it and nothing else
@@ -703,7 +723,7 @@ function ensureCss() {
 #${PANEL_ID}{scrollbar-width:thin;scrollbar-color:#ffffff2e transparent}
 #${PANEL_ID}::-webkit-scrollbar{width:10px}
 #${PANEL_ID}::-webkit-scrollbar-track{background:transparent}
-#${PANEL_ID}::-webkit-scrollbar-thumb{background:#ffffff24;border:3px solid transparent;background-clip:content-box;border-radius:999px}
+#${PANEL_ID}::-webkit-scrollbar-thumb{background:${INK.line};border:3px solid transparent;background-clip:content-box;border-radius:2px}
 #${PANEL_ID}::-webkit-scrollbar-thumb:hover{background:#ffffff45;background-clip:content-box}
 #${PANEL_ID} .pd-grip{cursor:grab}
 #${PANEL_ID} .pd-grip:active{cursor:grabbing}
@@ -728,10 +748,10 @@ function panel(): HTMLElement {
             "position:fixed", "z-index:99999", `top:${pos.y}px`, `left:${pos.x}px`,
             `width:${settings.store.panelWidth}px`,
             "max-height:92vh", "overflow:auto", "padding:14px 18px 18px",
-            "background:#0d1017",
+            `background:${INK.bg}`,
             `color:${INK.base}`,
             `font:500 ${settings.store.fontSize}px/1.6 ui-monospace,"Cascadia Code","JetBrains Mono",Consolas,monospace`,
-            "pointer-events:none", "border:1px solid #ffffff1a", "border-radius:10px",
+            "pointer-events:none", `border:1px solid ${INK.line}`, "border-radius:4px",
             "box-shadow:0 24px 64px #000e",
             "outline:none"
         ].join(";");
