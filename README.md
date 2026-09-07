@@ -1,7 +1,7 @@
 # ProbeDeck
 
 A diagnostics panel that lives inside Discord, for people writing themes and plugins for
-it. Fourteen lenses, all idle until you open the panel.
+it. Fifteen lenses, all idle until you open the panel.
 
 It exists because the normal loop for this work is slow. You change a selector, rebuild,
 reload, wait fifteen seconds, and find out you guessed wrong. Most of what is here is
@@ -37,10 +37,19 @@ the element inspector can see through it to what you are clicking.
 ## For theme work
 
 **inspect** is the one to start with. Click any element and it prints the box chain, the
-layout its parent is applying, which rule actually won each property, and what is covering
-it. Above all that it hands you **ready to paste selectors** for the element and its
-ancestors, with the build hash already stripped and a live match count on each, so you can
-tell at a glance whether one is specific enough.
+layout its parent is applying, and what is covering it. Above all that it hands you
+**ready to paste selectors** for the element and its ancestors, with the build hash
+already stripped and a live match count on each, so you can tell at a glance whether one
+is specific enough.
+
+It also names which rule won each property and, more usefully, **the rules that lost**,
+with the value each one wanted and why it lost, whether that is specificity, order or a
+missing `!important`. The losing rule is usually your own line, and the reason is what
+tells you which part to change.
+
+Underneath that is every **custom property that reaches the element**, resolved at that
+point rather than globally. Most of a Discord theme lives in variables and there is
+nowhere else that shows you which ones actually arrive.
 
 **css** is a live scratchpad. Type a rule, press Ctrl+Enter, and it applies immediately.
 No build and no reload. It then reads back what the browser actually accepted and tells
@@ -48,8 +57,10 @@ you how many elements each selector matched, which catches the two usual dead en
 silently rejected over a brace, and a selector that matches nothing at all. Nothing here
 survives a reload, which is the point.
 
-**cost** takes a selector and reports what it costs the browser to run, and which parts of
-it are expensive on a hover or scroll path.
+**cost** with an empty box ranks the whole page. It collects every selector that has
+loaded, triages them on shape, times the worst forty properly, and lists them worst first
+with the stylesheet each came from. That last column is the point: it tells you where to
+go and fix it. Give it a selector instead and it does the same for that one alone.
 
 **audit** sweeps for overlapping panels and seams.
 
@@ -73,6 +84,12 @@ Add a third part and it shows you what the rewritten source would say:
 duration, newest first, filterable. This is usually faster than reading Discord's source
 to work out which endpoint does a thing. Click it in the UI and read the request.
 
+**flux** taps everything Discord dispatches internally. With an empty box it ranks event
+types by how often they have fired, so you can do a thing in the UI and see what it was
+called. Filter to one and you get the recent payloads with their field names, which is
+what you need before writing a subscription. It pairs with **rest**: one shows what leaves
+the client, the other what moves inside it.
+
 **patches** shows which registered patches have landed. **stores** searches Flux stores by
 name.
 
@@ -84,9 +101,9 @@ startup milestone took.
 
 ## Things worth knowing
 
-The **rest** lens captures request bodies, and those can contain what you typed, including
-message content. The copy button copies the whole panel, so read it before pasting it
-anywhere.
+The **rest** and **flux** lenses both see message content: one in request bodies, the
+other in dispatched payloads. The copy button copies the whole panel, so read it before
+pasting it anywhere. Nothing is written to disk, it only lives in memory until you reload.
 
 The **css** lens writes into a live style tag. It is for trying things, not keeping them.
 Copy anything you want into your theme before you reload.
