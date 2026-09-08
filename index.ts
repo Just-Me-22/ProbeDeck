@@ -458,14 +458,19 @@ function onInspectClick(e: MouseEvent) {
         : [];
     previous = el;
 
+    const contrastLines = contrast(el);
+
     inspectLines = [
         ...against,
         ...rule("BOX CHAIN  (clicked element first, outermost last)"),
         ...chain,
         ...rule("SELECTORS  (paste one of these straight into the theme)"),
         ...selectors(el),
-        ...rule("CONTRAST  (text against whatever actually paints behind it)"),
-        ...contrast(el),
+        // the contrast lens returns nothing for an element with no words of its own,
+        // and a heading over an empty section reads as a failure rather than a skip
+        ...(contrastLines.length
+            ? [...rule("CONTRAST  (text against whatever actually paints behind it)"), ...contrastLines]
+            : []),
         ...rule("VARIABLES  (every custom property that reaches this element)"),
         ...vars(el),
         ...rule("LAYOUT  (how the parent is placing it)"),

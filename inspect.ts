@@ -504,42 +504,96 @@ function describeShort(el: Element): string {
 
 const channel = (v: number) => v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
 
-function luminance(rgb: string): number | null {
-    const parts = rgb.match(/[\d.]+/g);
-    if (!parts || parts.length < 3) return null;
+const swatch = document.createElement("canvas");
+swatch.width = swatch.height = 1;
+const swatchCtx = swatch.getContext("2d", { willReadFrequently: true });
 
-    const [r, g, b] = parts.slice(0, 3).map(n => channel(Number(n) / 255));
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+/** discord paints in rgb(), color(srgb ...) and oklab(), and those disagree on both
+ *  syntax and range - srgb components are 0 to 1 where rgb components are 0 to 255.
+ *  painting the value and reading the pixel back is the only way to normalise all
+ *  three without writing a parser per syntax. */
+function toRgba(value: string): [number, number, number, number] | null {
+    if (!swatchCtx || !value) return null;
+
+    swatchCtx.clearRect(0, 0, 1, 1);
+    swatchCtx.fillStyle = "#000000";
+    swatchCtx.fillStyle = value;
+    // an unparseable value leaves fillStyle untouched, which is the sentinel above
+    if (swatchCtx.fillStyle === "#000000" && !/^(#000000|black|rgba?\(0,\s*0,\s*0)/.test(value.trim())) return null;
+
+    swatchCtx.fillRect(0, 0, 1, 1);
+    const [r, g, b, a] = swatchCtx.getImageData(0, 0, 1, 1).data;
+    return [r / 255, g / 255, b / 255, a / 255];
 }
 
-/** the first ancestor that actually paints something, since most elements are
- *  transparent and comparing text against transparent tells you nothing */
-function paintedBehind(el: Element): string {
+const over = (top: number[], under: number[]) =>
+    top.slice(0, 3).map((c, i) => c * top[3] + under[i] * (1 - top[3]));
+
+/** the nearest ancestor backgrounds composited down to an opaque one. a single
+ *  translucent layer is not a backdrop: this theme paints most surfaces at 20 to 40
+ *  percent alpha, so taking the first non-transparent colour reports the wrong ground
+ *  and the ratio comes out meaningless. */
+function backdrop(el: Element): number[] | null {
+    const layers: number[][] = [];
+
     for (let n: Element | null = el; n; n = n.parentElement) {
-        const bg = getComputedStyle(n as HTMLElement).backgroundColor;
-        if (bg && !/rgba?\([^)]*,\s*0\)$/.test(bg) && bg !== "transparent") return bg;
+        const colour = toRgba(getComputedStyle(n as HTMLElement).backgroundColor);
+        if (!colour || colour[3] === 0) continue;
+
+        layers.push(colour);
+        if (colour[3] >= 0.999) break;
     }
-    return "rgb(0, 0, 0)";
+
+    const ground = layers[layers.length - 1];
+    // no opaque layer anywhere up the tree, usually an image or a wallpaper showing
+    // through, and guessing a colour there would be worse than saying so
+    if (!ground || ground[3] < 0.999) return null;
+
+    let result = ground.slice(0, 3);
+    for (let i = layers.length - 2; i >= 0; i--) result = over(layers[i], result);
+    return result;
 }
+
+const luminance = (rgb: number[]) =>
+    0.2126 * channel(rgb[0]) + 0.7152 * channel(rgb[1]) + 0.0722 * channel(rgb[2]);
+
+/** only elements with their own words. running this on a layout container reports a
+ *  failure against text that is not there, which is how it cried wolf on a grid. */
+const hasOwnText = (el: Element) =>
+    Array.from(el.childNodes).some(n => n.nodeType === 3 && (n.textContent ?? "").trim() !== "");
 
 export function contrast(el: Element): string[] {
+    if (!hasOwnText(el)) return [];
+
     const cs = getComputedStyle(el as HTMLElement);
-    const fg = cs.color;
-    const bg = paintedBehind(el);
+    const fg = toRgba(cs.color);
+    const bg = backdrop(el);
 
-    const lf = luminance(fg);
+    if (!fg) return ["could not read the text colour off this element"];
+    if (!bg) {
+        return [
+            `text        ${cs.color}`,
+            "behind it   nothing opaque up the tree, so an image or the wallpaper is showing through",
+            "",
+            "no ratio: compositing against an unknown ground would be a guess"
+        ];
+    }
+
+    // translucent text sits on the backdrop too, so composite it before measuring
+    const text = fg[3] >= 0.999 ? fg.slice(0, 3) : over(fg, bg);
+
+    const lf = luminance(text);
     const lb = luminance(bg);
-    if (lf == null || lb == null) return ["could not read a colour off this element"];
-
     const ratio = (Math.max(lf, lb) + 0.05) / (Math.min(lf, lb) + 0.05);
+
     const size = parseFloat(cs.fontSize);
     const bold = Number(cs.fontWeight) >= 700;
     const large = size >= 24 || (size >= 18.66 && bold);
     const need = large ? 3 : 4.5;
 
     return [
-        `text        ${fg}`,
-        `behind it   ${bg}`,
+        `text        ${cs.color}`,
+        `behind it   ${bg.map(c => Math.round(c * 255)).join(", ")}${layersNote(el)}`,
         `ratio       ${ratio.toFixed(2)} to 1`,
         `needs       ${need} for ${large ? "large" : "normal"} text at ${size}px${bold ? " bold" : ""}`,
         "",
@@ -547,4 +601,17 @@ export function contrast(el: Element): string[] {
             ? `passes, with ${(ratio - need).toFixed(2)} to spare`
             : `FAILS by ${(need - ratio).toFixed(2)}. this is the white on white class of bug.`
     ];
+}
+
+/** says so when the ground was built from more than one translucent layer, because
+ *  the number above is then composited rather than a colour written anywhere */
+function layersNote(el: Element): string {
+    let count = 0;
+    for (let n: Element | null = el; n; n = n.parentElement) {
+        const colour = toRgba(getComputedStyle(n as HTMLElement).backgroundColor);
+        if (!colour || colour[3] === 0) continue;
+        count++;
+        if (colour[3] >= 0.999) break;
+    }
+    return count > 1 ? `  (composited from ${count} layers)` : "";
 }
