@@ -8,10 +8,12 @@ import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
 
 import { audit, overlaps } from "./audit";
+import { cornerLines } from "./corners";
 import { fluxLines, startFluxTap, stopFluxTap } from "./flux";
 import { compare, contrast, covering, layout, react, selectors, vars, winners } from "./inspect";
+import { mediaLines, widenTimingBuffer } from "./media";
 import { restLines, startTap, stopTap } from "./rest";
-import { costLines, diffLines, findLines, intlLines, patchLines, propsLines, regexLines, storeLines } from "./tools";
+import { costLines, diffLines, findLines, intlLines, invalidLines, patchLines, propsLines, regexLines, staleLines, storeLines, whenThemesRead } from "./tools";
 
 const PANEL_ID = "probe-deck";
 
@@ -59,8 +61,41 @@ const boot: string[] = [];
 const longTasks: { at: number; ms: number; }[] = [];
 const bootAt = performance.now();
 
+/** a long task says how long the main thread was held. a long animation frame says
+ *  which script held it, so this is what turns "something is slow" into a name. */
+const culprits: { at: number; ms: number; who: string; }[] = [];
+
+/** the same frames with their phases kept, so a window with no named script can say
+ *  whether the time went to style and layout instead of just reporting nothing */
+const loafFrames: { at: number; ms: number; script: number; raf: number; styleLayout: number; }[] = [];
+
 let taskObs: PerformanceObserver | null = null;
+let loafObs: PerformanceObserver | null = null;
 let msObs: MutationObserver | null = null;
+
+interface LoafScript {
+    duration: number;
+    invoker?: string;
+    invokerType?: string;
+    sourceURL?: string;
+    sourceFunctionName?: string;
+}
+
+interface LoafEntry extends PerformanceEntry {
+    renderStart?: number;
+    styleAndLayoutStart?: number;
+    scripts?: LoafScript[];
+}
+
+/** the invoker is the listener or callback discord registered, the source is where
+ *  the function was defined. one without the other is rarely enough to act on. */
+function culprit(script: LoafScript): string {
+    const invoker = script.invoker || script.invokerType || "unknown";
+    const fn = script.sourceFunctionName;
+    const file = script.sourceURL ? script.sourceURL.split("/").pop()!.split("?")[0] : "";
+    const where = [fn, file].filter(Boolean).join("  ");
+    return where ? `${invoker}   ${where}` : invoker;
+}
 
 function startCollectors() {
     for (const entry of performance.getEntriesByType("navigation") as PerformanceNavigationTiming[]) {
@@ -82,6 +117,41 @@ function startCollectors() {
         taskObs.observe({ type: "longtask", buffered: true });
     } catch { /* not every build exposes longtask */ }
 
+    try {
+        const obs = new PerformanceObserver(list => {
+            for (const entry of list.getEntries() as LoafEntry[]) {
+                const end = entry.startTime + entry.duration;
+                let script = 0;
+                for (const s of entry.scripts ?? []) {
+                    script += s.duration;
+                    // the long task floor is far too high here: a 500ms frame is usually
+                    // dozens of small callbacks, and filtering at 50ms hides all of them
+                    if (s.duration >= 5) culprits.push({ at: entry.startTime, ms: s.duration, who: culprit(s) });
+                }
+                // a frame runs start -> renderStart -> styleAndLayoutStart -> end. the first
+                // stretch is tasks, the second is raf callbacks, the last is style through
+                // to paint. anything in the first stretch that no script claims is either
+                // callbacks under chrome's 5ms reporting floor or browser work.
+                const raf = entry.renderStart && entry.styleAndLayoutStart
+                    ? entry.styleAndLayoutStart - entry.renderStart
+                    : 0;
+                loafFrames.push({
+                    at: entry.startTime,
+                    ms: entry.duration,
+                    script,
+                    raf,
+                    styleLayout: entry.styleAndLayoutStart ? end - entry.styleAndLayoutStart : 0
+                });
+            }
+            if (culprits.length > 600) culprits.splice(0, culprits.length - 600);
+            if (loafFrames.length > 600) loafFrames.splice(0, loafFrames.length - 600);
+        });
+        // observe throws on a chromium without the type, so only claim the observer
+        // once it is actually running. otherwise the lens reports the wrong reason.
+        obs.observe({ type: "long-animation-frame", buffered: true });
+        loafObs = obs;
+    } catch { /* older chromium has no long-animation-frame */ }
+
     const pending = new Map(MILESTONES);
     msObs = new MutationObserver(() => {
         for (const [name, sel] of [...pending]) {
@@ -96,10 +166,10 @@ function startCollectors() {
 
 // ------------------------------------------------------------------ lenses
 
-type Lens = "perf" | "boot" | "tasks" | "churn" | "inspect" | "css" | "audit"
-    | "find" | "props" | "intl" | "regex" | "rest" | "flux" | "patches" | "stores" | "cost" | "diff";
-const LENSES: Lens[] = ["perf", "boot", "tasks", "churn", "inspect", "css", "audit",
-    "find", "props", "intl", "regex", "rest", "flux", "patches", "stores", "cost", "diff"];
+type Lens = "perf" | "boot" | "tasks" | "churn" | "inspect" | "css" | "audit" | "corners"
+    | "find" | "props" | "intl" | "regex" | "rest" | "media" | "flux" | "patches" | "stores" | "cost" | "invalid" | "stale" | "diff";
+const LENSES: Lens[] = ["perf", "boot", "tasks", "churn", "inspect", "css", "audit", "corners",
+    "find", "props", "intl", "regex", "rest", "media", "flux", "patches", "stores", "cost", "invalid", "stale", "diff"];
 let lens: Lens = "perf";
 
 let frames: number[] = [];
@@ -153,6 +223,60 @@ function perfLines(): string[] {
     ];
 }
 
+/** how much the pointer moved during the window. two readings only compare if the
+ *  hands were doing the same thing, and that was the hardest part to hold steady by
+ *  hand. */
+let pointerAt: number[] = [];
+
+function onPointer() {
+    pointerAt.push(performance.now());
+    if (pointerAt.length > 4000) pointerAt = pointerAt.slice(-2000);
+}
+
+interface Snapshot {
+    blocks: number;
+    blocked: number;
+    moves: number;
+    frames: number;
+    total: number;
+    script: number;
+    unnamed: number;
+    raf: number;
+    styleLayout: number;
+}
+
+let baseline: Snapshot | null = null;
+
+function blameTotals(since: number) {
+    const seen = loafFrames.filter(f => f.at > since);
+    const total = seen.reduce((a, f) => a + f.ms, 0);
+    const script = seen.reduce((a, f) => a + f.script, 0);
+    const raf = seen.reduce((a, f) => a + f.raf, 0);
+    const styleLayout = seen.reduce((a, f) => a + f.styleLayout, 0);
+    return { frames: seen.length, total, script, raf, styleLayout, unnamed: Math.max(0, total - script - raf - styleLayout) };
+}
+
+function snapshot(): Snapshot {
+    const since = performance.now() - 30_000;
+    const blocks = longTasks.filter(t => t.at > since);
+    return {
+        blocks: blocks.length,
+        blocked: blocks.reduce((a, b) => a + b.ms, 0),
+        moves: pointerAt.filter(at => at > since).length,
+        ...blameTotals(since)
+    };
+}
+
+export function markBaseline() {
+    baseline = snapshot();
+}
+
+const delta = (now: number, was: number, unit = "") => {
+    const diff = now - was;
+    const pct = was ? `  ${diff >= 0 ? "+" : ""}${Math.round(diff / was * 100)}%` : "";
+    return `   was ${was.toFixed(0)}${unit}, ${diff >= 0 ? "+" : ""}${diff.toFixed(0)}${unit}${pct}`;
+};
+
 function taskLines(): string[] {
     if (!longTasks.length) return ["no long tasks recorded yet"];
 
@@ -180,10 +304,17 @@ function taskLines(): string[] {
 
     const worst = [...recent].sort((a, b) => b.ms - a.ms).slice(0, 8);
 
+    const up = performance.now() / 1000;
+    const moves = pointerAt.filter(at => at > now - window).length;
+    const blocked = recent.reduce((a, b) => a + b.ms, 0);
+
     return [
         `route            ${route()}`,
-        `blocks /30s      ${recent.length}`,
-        `blocked /30s     ${recent.reduce((a, b) => a + b.ms, 0).toFixed(0)}ms`,
+        `since load       ${up.toFixed(0)}s${up < 60 ? "   <- still starting up, this reading is not comparable" : ""}`,
+        `mouse moves      ${moves}${moves < 20 ? "   (hands off)" : ""}${baseline ? delta(moves, baseline.moves) : ""}`,
+        "",
+        `blocks /30s      ${recent.length}${baseline ? delta(recent.length, baseline.blocks) : ""}`,
+        `blocked /30s     ${blocked.toFixed(0)}ms${baseline ? delta(blocked, baseline.blocked, "ms") : ""}`,
         "",
         `median gap       ${median.toFixed(0)}ms`,
         `gap spread       ${spread.toFixed(0)}ms   ${gaps.length > 3 && spread < median * 0.5
@@ -195,7 +326,57 @@ function taskLines(): string[] {
         "  -30s" + "now".padStart(59),
         "",
         "worst blocks:",
-        ...worst.map(t => `  ${t.ms.toFixed(0).padStart(5)}ms  ${((now - t.at) / 1000).toFixed(1)}s ago`)
+        ...worst.map(t => `  ${t.ms.toFixed(0).padStart(5)}ms  ${((now - t.at) / 1000).toFixed(1)}s ago`),
+        "",
+        ...blameLines(now - window)
+    ];
+}
+
+/** ranks by total time held rather than by the single worst frame, because the thing
+ *  that ruins an app is usually the one firing constantly, not the one big hitch */
+function blameLines(since: number): string[] {
+    if (!loafObs) return ["this chromium has no long-animation-frame, so blocks cannot be attributed."];
+
+    const seen = loafFrames.filter(f => f.at > since);
+    if (!seen.length) return ["no long animation frames in this window, so there is nothing to attribute."];
+
+    const { total, script, raf, styleLayout, unnamed } = blameTotals(since);
+    const share = (ms: number) => `${ms.toFixed(0).padStart(6)}ms ${((ms / total) * 100).toFixed(0).padStart(4)}%`;
+    const was = (now: number, before: number) => baseline ? delta(now, before, "ms") : "";
+
+    const row = (label: string, ms: number, before: number, note = "") =>
+        `  ${label.padEnd(20)} ${share(ms)}${note}${was(ms, before)}`;
+
+    const split = [
+        `slow frames            ${seen.length}, ${total.toFixed(0)}ms in total${was(total, baseline?.total ?? 0)}`,
+        row("named script", script, baseline?.script ?? 0, "   listeners and callbacks over 5ms"),
+        row("unnamed before paint", unnamed, baseline?.unnamed ?? 0, "   callbacks under 5ms, and browser work"),
+        row("raf callbacks", raf, baseline?.raf ?? 0),
+        row("style, layout, paint", styleLayout, baseline?.styleLayout ?? 0),
+        ""
+    ];
+
+    const recent = culprits.filter(c => c.at > since);
+    if (!recent.length) {
+        return [...split,
+            "no single script ran for 5ms, which is chrome's floor for naming one. the",
+            "split above is the whole answer available here."];
+    }
+
+    const tally = new Map<string, { ms: number; hits: number; }>();
+    for (const c of recent) {
+        const row = tally.get(c.who) ?? { ms: 0, hits: 0 };
+        row.ms += c.ms;
+        row.hits++;
+        tally.set(c.who, row);
+    }
+
+    return [...split,
+        "who held the main thread (total time, worst first):",
+        ...[...tally]
+            .sort((a, b) => b[1].ms - a[1].ms)
+            .slice(0, 12)
+            .map(([who, row]) => `  ${row.ms.toFixed(0).padStart(5)}ms  ${String(row.hits).padStart(4)}x  ${who.slice(0, 66)}`)
     ];
 }
 
@@ -274,6 +455,20 @@ const lensCache = new Map<string, string[]>();
 /** set when a lens with a query box is opened, so the box takes focus once */
 let pendingFocus = false;
 
+/** what is in the box now, which is not the query that last ran: that only changes on
+ *  enter. a live lens repaints twice a second and rebuilds the box, so half typed text
+ *  and the caret with it have to survive across that. */
+let draft: string | null = null;
+let caret: [number, number] | null = null;
+
+// the first cost sweep runs before the themes have been read off disk, so its answer
+// is missing them. throw it away and paint again once they are in.
+whenThemesRead(() => {
+    for (const key of Array.from(lensCache.keys()))
+        if (key.startsWith("cost:") || key.startsWith("stale:") || key.startsWith("invalid:")) lensCache.delete(key);
+    if ((lens === "cost" || lens === "stale" || lens === "invalid") && isOpen()) { lastPaint = ""; render(); }
+});
+
 function cached(key: string, run: () => string[]): string[] {
     const hit = lensCache.get(key);
     if (hit) return hit;
@@ -289,10 +484,14 @@ function typedLines(which: Lens): string[] {
         case "regex": return cached(`regex:${q}`, () => regexLines(q));
         case "stores": return cached(`stores:${q}`, () => storeLines(q));
         case "cost": return cached(`cost:${q}`, () => costLines(q));
+        case "invalid": return cached(`invalid:${q}`, () => invalidLines(q));
+        case "stale": return cached(`stale:${q}`, () => staleLines(q));
+        case "corners": return cached(`corners:${q}`, () => cornerLines(q));
         case "css": return cssLines(q);
         case "props": return cached(`props:${q}`, () => propsLines(q));
         case "intl": return cached(`intl:${q}`, () => intlLines(q));
         case "rest": return restLines(q);
+        case "media": return mediaLines(q);
         case "flux": return fluxLines(q);
         case "patches": return cached("patches", () => patchLines());
         case "diff": return cached("diff", () => diffLines(MILESTONES));
@@ -308,9 +507,13 @@ const PROMPTS: Partial<Record<Lens, string>> = {
     intl: "words you can see on screen",
     regex: "<find> | <regex> | <replacement, optional>",
     rest: "filter by method or path",
+    media: "part of a url, or leave it empty for everything",
     flux: "part of an event name",
     stores: "part of a store name",
-    cost: "a css selector, or leave it empty to rank every rule"
+    cost: "a css selector, or leave it empty to rank every rule",
+    invalid: "part of a sheet name or selector, or leave it empty for all of them",
+    stale: "part of a class name, or leave it empty for all of them",
+    corners: "a selector to look inside, or leave it empty for the whole screen"
 };
 
 const SCRATCH_ID = "probe-deck-scratch";
@@ -492,18 +695,18 @@ function onInspectClick(e: MouseEvent) {
 /** Tokyo Night, the palette this client already wears, so the panel reads as part of
  *  the setup rather than something bolted on top of it */
 const INK = {
-    bg: "#1a1b26",
-    line: "#2f334d",
-    base: "#c0caf5",
-    dim: "#565f89",
-    tag: "#7dcfff",
-    cls: "#9ece6a",
-    num: "#9ece6a",
-    str: "#e0af68",
-    token: "#bb9af7",
-    warn: "#f7768e",
-    accent: "#7aa2f7",
-    on: "#bb9af7"
+    bg: "#000000",
+    line: "#333333",
+    base: "#ffffff",
+    dim: "#5e5e5e",
+    tag: "#ffffff",
+    cls: "#ffffff",
+    num: "#ff5c00",
+    str: "#ffffff",
+    token: "#ff5c00",
+    warn: "#ff5c00",
+    accent: "#ff5c00",
+    on: "#ff5c00"
 };
 
 // a class has to start the piece, or x=155..500 colours ".500" as one
@@ -540,8 +743,9 @@ function lineEl(text: string): HTMLElement {
 
 function headingEl(title: string): HTMLElement {
     const div = document.createElement("div");
-    div.style.cssText = "margin:26px 0 12px;padding-bottom:6px;border-bottom:1px solid #ffffff14;" +
-        `color:${INK.dim};font-size:0.82em;font-weight:600`;
+    div.style.cssText = "margin:24px 0 10px;padding-bottom:5px;" +
+        `border-bottom:1px solid ${INK.line};text-transform:uppercase;letter-spacing:0.06em;` +
+        `color:${INK.base};font-size:0.8em;font-weight:700`;
     div.textContent = title.trim();
     return div;
 }
@@ -568,10 +772,10 @@ function chip(text: Lens, active: boolean): HTMLElement {
     s.className = "pd-chip";
     // the panel is pointer-events:none so the inspect lens can see through it;
     // a tab has to opt itself back in, the way the copy button already does
-    s.style.cssText = "padding:2px 3px;font-size:0.86em;" +
+    s.style.cssText = "padding:2px 5px;font-size:0.82em;text-transform:uppercase;letter-spacing:0.06em;" +
         "pointer-events:auto;cursor:pointer;user-select:none;" +
         (active
-            ? `color:${INK.on};font-weight:700;box-shadow:inset 0 -2px 0 ${INK.on}`
+            ? `color:${INK.bg};background:${INK.accent};font-weight:700`
             : `color:${INK.dim};font-weight:500`);
 
     s.addEventListener("pointerdown", e => {
@@ -659,7 +863,7 @@ function chromeEl(): HTMLElement {
     bar.appendChild(copy);
 
     const keys = document.createElement("span");
-    keys.textContent = "drag to move    click a tab or press 1-9    ← → lens    f9 hide  f10 reset";
+    keys.textContent = "drag to move    click a tab or press 1-9    ← → lens, tab while typing    f9 hide  f10 reset";
     keys.style.cssText = `color:${INK.dim};margin-left:auto`;
     bar.appendChild(keys);
 
@@ -670,16 +874,27 @@ function chromeEl(): HTMLElement {
         const box = document.createElement(multiline ? "textarea" : "input") as HTMLInputElement & HTMLTextAreaElement;
         box.className = "pd-query";
         box.placeholder = prompt;
-        box.value = queries[lens] ?? "";
+        box.value = draft ?? queries[lens] ?? "";
         box.spellcheck = false;
         box.style.cssText = "flex:0 0 100%;margin-top:8px;padding:6px 10px;pointer-events:auto;" +
             (multiline ? "min-height:84px;resize:vertical;" : "") +
-            `border:1px solid ${INK.line};border-radius:3px;font:inherit;background:#16161e;color:${INK.base};outline:none`;
+            `border:1px solid ${INK.line};border-radius:0;font:inherit;background:${INK.bg};color:${INK.base};outline:none`;
 
         // the arrows change lens and discord's composer eats the rest, so while this
         // has focus every key belongs to it and nothing else
         box.addEventListener("keydown", e => {
             e.stopPropagation();
+
+            // the box owns the arrows and the digits while it has focus, which leaves
+            // no way to change lens from the keyboard. tab is that way, and show()
+            // puts the caret in the next lens's box
+            if (e.key === "Tab") {
+                e.preventDefault();
+                queries[lens] = box.value;
+                step(e.shiftKey ? -1 : 1);
+                return;
+            }
+
             // plain enter has to stay a newline in the textarea, so ctrl or shift sends
             if (e.key !== "Enter" || (multiline && !e.ctrlKey && !e.shiftKey)) return;
             e.preventDefault();
@@ -692,7 +907,9 @@ function chromeEl(): HTMLElement {
 
         // replaceChildren throws the focused node away on every repaint, so put it back
         if (pendingFocus) {
-            queueMicrotask(() => { box.focus(); box.setSelectionRange(box.value.length, box.value.length); });
+            const [start, end] = caret ?? [box.value.length, box.value.length];
+            caret = null;
+            queueMicrotask(() => { box.focus(); box.setSelectionRange(start, end); });
             pendingFocus = false;
         }
     }
@@ -708,9 +925,9 @@ function chromeEl(): HTMLElement {
 
 const POS_KEY = "probe-deck-pos";
 
-/** where the panel was left. top right by default, which is where it always used to sit */
+/** where the panel was left, top left until you move it */
 function loadPos(): { x: number; y: number; } {
-    const fallback = { x: Math.max(10, innerWidth - settings.store.panelWidth - 10), y: 10 };
+    const fallback = { x: 10, y: 10 };
     try {
         const raw = localStorage.getItem(POS_KEY);
         if (!raw) return fallback;
@@ -752,8 +969,8 @@ function ensureCss() {
 #${PANEL_ID} .pd-grip{cursor:grab}
 #${PANEL_ID} .pd-grip:active{cursor:grabbing}
 #${PANEL_ID} .pd-copy:hover{background:#ffffff2e}
-#${PANEL_ID} .pd-query:focus{border-color:#4c7dff;background:#4c7dff14}
-#${PANEL_ID} .pd-query::placeholder{color:#5d6d82}`;
+#${PANEL_ID} .pd-query:focus{border-color:${INK.accent};background:transparent}
+#${PANEL_ID} .pd-query::placeholder{color:${INK.dim}}`;
     document.documentElement.appendChild(style);
 }
 
@@ -775,8 +992,8 @@ function panel(): HTMLElement {
             `background:${INK.bg}`,
             `color:${INK.base}`,
             `font:500 ${settings.store.fontSize}px/1.6 ui-monospace,"Cascadia Code","JetBrains Mono",Consolas,monospace`,
-            "pointer-events:none", `border:1px solid ${INK.line}`, "border-radius:4px",
-            "box-shadow:0 24px 64px #000e",
+            "pointer-events:none", `border:2px solid ${INK.accent}`, "border-radius:0",
+            "box-shadow:none",
             "outline:none"
         ].join(";");
         document.documentElement.appendChild(el);
@@ -798,9 +1015,10 @@ function render() {
     const el = document.getElementById(PANEL_ID);
     if (!el) return;
     const body = frozen ?? bodyOf();
+    lastBody = body.join(String.fromCharCode(10));
     lastText = [
         `PROBE DECK  [${LENSES.map(l => (l === lens ? `(${l})` : l)).join(" ")}]`,
-        "left/right arrow lens   ctrl+alt+p hide   ctrl+alt+r reset   copy button in the header",
+        "left/right arrow lens   ctrl+alt+b baseline   ctrl+alt+p hide   ctrl+alt+r reset   copy in header",
         "-".repeat(74),
         ...body
     ].join("\n");
@@ -812,6 +1030,15 @@ function render() {
     lastPaint = key;
 
     const top = el.scrollTop;
+    // replaceChildren throws away whatever had focus, and a live lens gets here twice a
+    // second. without carrying the caret over, typing into flux or churn loses it after
+    // the first repaint and the rest of the keystrokes go to discord's composer.
+    const typing = document.activeElement as HTMLInputElement | null;
+    if (typing?.classList.contains("pd-query")) {
+        draft = typing.value;
+        caret = [typing.selectionStart ?? typing.value.length, typing.selectionEnd ?? typing.value.length];
+        pendingFocus = true;
+    }
     el.replaceChildren(chromeEl(), bodyEl(body));
     el.scrollTop = top;
 }
@@ -828,6 +1055,7 @@ function onWheel(e: WheelEvent) {
 }
 
 let lastText = "";
+let lastBody = "";
 let lastPaint = "";
 let copyNote = "";
 /** perf and churn repaint twice a second, which makes them unreadable while you are
@@ -839,11 +1067,11 @@ let frozen: string[] | null = null;
  *  a downscaled capture turns this text to mush. */
 async function copyPanel() {
     try {
-        await navigator.clipboard.writeText(lastText);
-        copyNote = `copied ${lastText.length} chars to the clipboard`;
+        await navigator.clipboard.writeText(lastBody);
+        copyNote = `copied ${lastBody.length} chars to the clipboard`;
     } catch {
         const ta = document.createElement("textarea");
-        ta.value = lastText;
+        ta.value = lastBody;
         ta.style.cssText = "position:fixed;top:-9999px";
         document.body.appendChild(ta);
         ta.select();
@@ -882,6 +1110,8 @@ function show(next: Lens) {
     frozen = null;
     lens = next;
     lens === "churn" ? startChurn() : stopChurn();
+    draft = null;
+    caret = null;
     pendingFocus = PROMPTS[lens] != null;
     lastPaint = "";
     render();
@@ -903,6 +1133,8 @@ function typingInto(e: KeyboardEvent): boolean {
 
 function reset() {
     longTasks.length = 0;
+    culprits.length = 0;
+    loafFrames.length = 0;
     frames = [];
     auditCache = [];
     lensCache.clear();
@@ -948,20 +1180,23 @@ function onKey(e: KeyboardEvent) {
     const k = e.code;
     if (k === "KeyP") { e.preventDefault(); isOpen() ? close() : open(); return; }
     if (!isOpen()) return;
-    if (k === "KeyR") { e.preventDefault(); reset(); }
+    if (k === "KeyR") { e.preventDefault(); reset(); return; }
+    if (k === "KeyB") { e.preventDefault(); markBaseline(); lastPaint = ""; render(); }
 }
 
 export default definePlugin({
     name: "ProbeDeck",
-    description: "Always-on diagnostics that stay idle until you open them. F9 toggles the panel, F10 clears it, then click a tab, press a number, or use the left and right arrows to move between lenses: frame timing, startup, main-thread blocks, DOM churn and an element inspector.",
+    description: "Always-on diagnostics that stay idle until you open them. F9 toggles the panel, F10 clears it, ctrl+alt+b marks a baseline to measure the next reading against, then click a tab, press a number, or use the left and right arrows to move between lenses: frame timing, startup, main-thread blocks, media loading, css invalidation, DOM churn and an element inspector.",
     authors: [{ name: "heart_menace", id: 281162701303185408n }],
     settings,
 
     start() {
         startCollectors();
         startTap();
+        widenTimingBuffer();
         startFluxTap();
         window.addEventListener("keydown", onKey, true);
+        window.addEventListener("pointermove", onPointer, { passive: true, capture: true });
         if (settings.store.openOnStart) setTimeout(open, 3000);
     },
 
@@ -969,7 +1204,11 @@ export default definePlugin({
         stopTap();
         stopFluxTap();
         window.removeEventListener("keydown", onKey, true);
+        window.removeEventListener("pointermove", onPointer, true);
+        pointerAt = [];
+        baseline = null;
         taskObs?.disconnect();
+        loafObs?.disconnect();
         msObs?.disconnect();
         close();
     }

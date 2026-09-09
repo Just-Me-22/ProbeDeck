@@ -7,6 +7,7 @@
 /** The lenses that answer a typed question. Everything here reads Discord's own
  *  modules and Vencord's patch bookkeeping, so none of it needs the console. */
 
+import { Settings } from "@api/Settings";
 import { fluxStores, wreq } from "@webpack";
 import { getFactoryPatchedSource, patches } from "@webpack/patcher";
 
@@ -287,49 +288,143 @@ function smell(sel: string): number {
     return score;
 }
 
-/** every selector the page has loaded, with the sheet it came from */
-function allSelectors(): { sel: string; from: string; }[] {
-    const out: { sel: string; from: string; }[] = [];
-    const seen = new Set<string>();
+/** selectorText keeps the commas inside :is(), :not() and :has(), so a plain split
+ *  hands back fragments that do not parse and get timed as n/a */
+function topLevelParts(selector: string): string[] {
+    const parts: string[] = [];
+    let depth = 0;
+    let start = 0;
+    for (let i = 0; i < selector.length; i++) {
+        const c = selector[i];
+        if (c === "(") depth++;
+        else if (c === ")") depth--;
+        else if (c === "," && depth === 0) {
+            parts.push(selector.slice(start, i));
+            start = i + 1;
+        }
+    }
+    parts.push(selector.slice(start));
+    return parts;
+}
+
+/** equicord imports local themes over vencord://, which is a different origin, so the
+ *  browser refuses to hand back their rules. the file is readable over ipc though, and
+ *  a constructed sheet built from that text is same origin and rankable. */
+let themeSheets: { name: string; sheet: CSSStyleSheet; }[] | null = null;
+let themesPending = false;
+let onThemesRead: (() => void) | null = null;
+
+/** the sweep costs seconds to run, so it has to stay cached. this is how the cache
+ *  learns the first result was taken before the themes had arrived. */
+export function whenThemesRead(fn: () => void) {
+    onThemesRead = fn;
+}
+
+function loadThemeSheets() {
+    if (themeSheets || themesPending) return;
+    themesPending = true;
+
+    const names: string[] = Settings.enabledThemes ?? [];
+    Promise.all(names.map(async name => {
+        try {
+            const text = await VencordNative.themes.getThemeData(name);
+            if (!text) return null;
+            const sheet = new CSSStyleSheet();
+            sheet.replaceSync(text);
+            return { name, sheet };
+        } catch {
+            return null;
+        }
+    })).then(loaded => {
+        themeSheets = loaded.filter(entry => entry != null) as { name: string; sheet: CSSStyleSheet; }[];
+        themesPending = false;
+        onThemesRead?.();
+    });
+}
+
+function sheetName(sheet: CSSStyleSheet): string {
+    if (sheet.href) return sheet.href.split("/").pop()!.split("?")[0].slice(0, 28);
+    const node = sheet.ownerNode as HTMLElement | null;
+    return node?.id || node?.className || "inline style";
+}
+
+/** hands every style rule the page has loaded to `visit`, with the sheet it came from,
+ *  and returns the sheets that threw. a theme that goes missing from a ranking without a
+ *  word is always in that list. */
+function walkStyleRules(visit: (rule: CSSStyleRule, from: string) => void): string[] {
+    const unreadable: string[] = [];
+
+    const walk = (list: CSSRuleList, from: string) => {
+        for (const rule of Array.from(list)) {
+            // equicord loads every theme as an @import inside one <style>, so without this
+            // the whole theme is invisible here
+            if (rule instanceof CSSImportRule) {
+                const inner = rule.styleSheet;
+                const name = inner ? sheetName(inner) : rule.href.split("/").pop()!.slice(0, 28);
+                try {
+                    if (inner) walk(inner.cssRules, name);
+                    else unreadable.push(name);
+                } catch {
+                    unreadable.push(name);
+                }
+                continue;
+            }
+
+            // a style rule carries selectorText AND, since css nesting shipped, an empty
+            // cssRules. reading cssRules first threw every rule on the page away.
+            if ((rule as CSSStyleRule).selectorText) visit(rule as CSSStyleRule, from);
+
+            const nested = (rule as CSSGroupingRule).cssRules;
+            if (nested) walk(nested, from);
+        }
+    };
 
     for (const sheet of Array.from(document.styleSheets)) {
-        let rules: CSSRuleList;
         try {
-            rules = sheet.cssRules;
+            walk(sheet.cssRules, sheetName(sheet));
         } catch {
-            continue;
+            unreadable.push(sheetName(sheet));
         }
-
-        const node = sheet.ownerNode as HTMLElement | null;
-        const from = sheet.href
-            ? sheet.href.split("/").pop()!.slice(0, 28)
-            : node?.id || node?.className || "inline style";
-
-        const walk = (list: CSSRuleList) => {
-            for (const rule of Array.from(list)) {
-                const nested = (rule as CSSGroupingRule).cssRules;
-                if (nested) { walk(nested); continue; }
-
-                const selector = (rule as CSSStyleRule).selectorText;
-                if (!selector) continue;
-
-                for (const part of selector.split(",")) {
-                    const sel = part.trim();
-                    if (!sel || seen.has(sel)) continue;
-                    seen.add(sel);
-                    out.push({ sel, from: String(from) });
-                }
-            }
-        };
-        walk(rules);
     }
 
-    return out;
+    const readOverIpc = new Set<string>();
+    for (const { name, sheet } of themeSheets ?? []) {
+        const short = name.split("/").pop()!.slice(0, 28);
+        readOverIpc.add(short);
+        walk(sheet.cssRules, short);
+    }
+
+    return unreadable.filter(name => !readOverIpc.has(name));
+}
+
+function allSelectors(): { found: { sel: string; from: string; }[]; unreadable: string[]; } {
+    const found: { sel: string; from: string; }[] = [];
+    const seen = new Set<string>();
+
+    const unreadable = walkStyleRules((rule, from) => {
+        for (const part of topLevelParts(rule.selectorText)) {
+            const sel = part.trim();
+            if (!sel || seen.has(sel)) continue;
+            seen.add(sel);
+            found.push({ sel, from });
+        }
+    });
+
+    return { found, unreadable };
 }
 
 function sweepLines(): string[] {
-    const all = allSelectors();
-    if (!all.length) return ["no stylesheet could be read, so there is nothing to rank"];
+    loadThemeSheets();
+    const { found: all, unreadable } = allSelectors();
+    if (!all.length) {
+        return [
+            "no stylesheet could be read, so there is nothing to rank",
+            "",
+            ...(unreadable.length
+                ? ["these threw when read, which means a different origin:", "", ...unreadable.map(n => `  ${n}`)]
+                : ["nothing threw either, so the page reported no rules at all"])
+        ];
+    }
 
     // time only the worst smelling ones: timing thousands of selectors would itself
     // be the slowest thing on the page
@@ -367,7 +462,95 @@ function sweepLines(): string[] {
             `${e.each < 0 ? "  n/a" : e.each.toFixed(3).padStart(7)}ms  ${String(e.count).padStart(5)} hits  ${e.from.padEnd(20)} ${e.sel.slice(0, 60)}`),
         "",
         "the sheet name is where to go and fix it. :has() and [class*=] are the two",
-        "that usually account for most of the total."
+        "that usually account for most of the total.",
+        ...(themeSheets
+            ? []
+            : ["", "your local themes are still loading over ipc. open this lens again and they will be in the ranking."]),
+        ...(unreadable.length
+            ? ["", `not counted, a different origin so the rules cannot be read: ${unreadable.join(", ")}`]
+            : [])
+    ];
+}
+
+/** a discord class carries a build hash, so .bar_c38106 becomes .bar_9f21ab on the next
+ *  canary. a theme written against the old hash still parses and still ranks in the cost
+ *  lens, it just matches nothing. this names those, and offers the class discord has
+ *  under the same prefix now, which is almost always the rename. */
+export function staleLines(query: string): string[] {
+    loadThemeSheets();
+    const { found } = allSelectors();
+    if (!found.length) return ["no stylesheet could be read, so there is nothing to check"];
+
+    const mine = new Set((Settings.enabledThemes ?? []).map(n => n.split("/").pop()!.slice(0, 28)));
+    if (!mine.size) return ["no themes are enabled, so there is nothing to check"];
+    if (!found.some(entry => mine.has(entry.from)))
+        return ["the theme is not readable yet. open this lens again in a second."];
+
+    const classesIn = (sel: string) => sel.match(/\.-?[_a-zA-Z][\w-]*/g)?.map(c => c.slice(1)) ?? [];
+    const prefixOf = (name: string) => name.replace(/_{1,2}[a-f0-9]{5,7}$/i, "");
+    const hashed = (name: string) => /_{1,2}[a-f0-9]{5,7}$/i.test(name);
+
+    // everything discord itself still ships, and what it calls each prefix now
+    const live = new Set<string>();
+    const byPrefix = new Map<string, Set<string>>();
+    for (const entry of found) {
+        if (mine.has(entry.from)) continue;
+        for (const name of classesIn(entry.sel)) {
+            live.add(name);
+            if (!hashed(name)) continue;
+            const prefix = prefixOf(name);
+            (byPrefix.get(prefix) ?? byPrefix.set(prefix, new Set()).get(prefix)!).add(name);
+        }
+    }
+
+    const uses = new Map<string, number>();
+    for (const entry of found) {
+        if (!mine.has(entry.from)) continue;
+        for (const name of classesIn(entry.sel)) uses.set(name, (uses.get(name) ?? 0) + 1);
+    }
+
+    // discord builds one module into one hash, so every class from a module shares a
+    // suffix. the theme's classes that still work tell us which suffixes are current,
+    // and a candidate carrying one of those is almost always the rename you want.
+    const suffixOf = (name: string) => name.slice(prefixOf(name).length);
+    const known = new Set<string>();
+    for (const [name] of uses)
+        if (hashed(name) && live.has(name)) known.add(suffixOf(name));
+
+    const filter = query.trim().toLowerCase();
+    const gone = [...uses]
+        .filter(([name]) => hashed(name) && !live.has(name))
+        .filter(([name]) => !filter || name.toLowerCase().includes(filter))
+        .sort((a, b) => b[1] - a[1]);
+
+    const rows = gone.flatMap(([name, count]) => {
+        const now = [...(byPrefix.get(prefixOf(name)) ?? [])]
+            .sort((a, b) => Number(known.has(suffixOf(b))) - Number(known.has(suffixOf(a))));
+        const best = now[0];
+        const confident = best != null && known.has(suffixOf(best));
+
+        const head = `  ${String(count).padStart(3)}x  .${name.padEnd(30)} `;
+        if (!now.length) return [head + "gone outright, nothing under that prefix"];
+        if (confident) return [head + `-> ${best}   (that module is already working here)`];
+        return [head + `?  ${now.slice(0, 4).join(", ")}${now.length > 4 ? ` +${now.length - 4} more` : ""}`];
+    });
+
+    const sure = gone.filter(([name]) => {
+        const now = [...(byPrefix.get(prefixOf(name)) ?? [])];
+        return now.some(c => known.has(suffixOf(c)));
+    }).length;
+
+    return [
+        `theme classes    ${uses.size} used, ${[...uses].filter(([n]) => hashed(n)).length} of them hashed`,
+        `still in discord ${[...uses].filter(([n]) => hashed(n) && live.has(n)).length}`,
+        `gone             ${gone.length}   these rules parse and match nothing`,
+        "",
+        ...(rows.length ? rows : ["nothing stale, every hashed class the theme uses still exists."]),
+        "",
+        `-> is a confident rename, ${sure} of them. the class comes from a module the theme`,
+        "already talks to, so the suffix is one that is known good here.",
+        "?  means the prefix is shared and the module is not one the theme uses. click the",
+        "element with the inspect lens rather than picking one off this list."
     ];
 }
 
@@ -535,4 +718,156 @@ export function intlLines(query: string): string[] {
 
     if (!found.length) return [`no message contains "${query.trim()}"`];
     return [`${found.length} message${found.length > 1 ? "s" : ""} containing "${query.trim()}"`, "", ...found];
+}
+
+// ------------------------------------------------------- invalidation lens
+// What a rule costs to match is one half of CSS. The other half is how much has to be
+// thrown away and worked out again when the rule's answer changes, and nothing else
+// here measures that. A :root:has() setting an inherited variable cost ~5000ms of main
+// thread per 30s on a ticking progress bar while every timing lens called it cheap.
+
+/** set on an element, these reach every descendant, so recomputing one recomputes the
+ *  whole subtree. custom properties are all inherited, which is what makes them the
+ *  expensive thing to put behind a condition. */
+const INHERITED = new Set([
+    "color", "cursor", "direction", "font", "font-family", "font-feature-settings",
+    "font-size", "font-stretch", "font-style", "font-variant", "font-weight",
+    "letter-spacing", "line-height", "list-style", "list-style-image",
+    "list-style-position", "list-style-type", "quotes", "text-align", "text-indent",
+    "text-transform", "visibility", "white-space", "word-break", "word-spacing",
+    "caret-color", "accent-color", "text-shadow", "-webkit-text-fill-color"
+]);
+
+const inheritedIn = (style: CSSStyleDeclaration) =>
+    Array.from(style).filter(prop => prop.startsWith("--") || INHERITED.has(prop));
+
+/** the part of a selector up to and including its first :has(), which is the element the
+ *  browser has to re-check. everything after it only narrows what the rule then paints.
+ *  the :has() is often nested, as in :not(:has(*)), so this closes every group it is
+ *  inside rather than only the :has() itself. cutting at the inner paren left the anchor
+ *  unbalanced and it matched nothing. */
+function hasAnchor(selector: string): string | null {
+    let depth = 0;
+    let seen = false;
+
+    for (let i = 0; i < selector.length; i++) {
+        if (selector.startsWith(":has(", i)) seen = true;
+
+        if (selector[i] === "(") depth++;
+        else if (selector[i] === ")") {
+            depth--;
+            if (seen && depth === 0) return selector.slice(0, i + 1);
+        }
+    }
+
+    return null;
+}
+
+interface Invalidation {
+    from: string;
+    selector: string;
+    anchor: string;
+    matches: number;
+    blast: number;
+    inherited: string[];
+    hover: boolean;
+}
+
+/** how many elements have to be worked out again when this rule flips. an inherited
+ *  property drags the whole subtree with it, anything else stops at the element. */
+function blastOf(anchor: string, inherited: boolean): { matches: number; blast: number; } | null {
+    let found: NodeListOf<Element>;
+    try {
+        found = document.querySelectorAll(anchor);
+    } catch {
+        return null;
+    }
+
+    if (!inherited) return { matches: found.length, blast: found.length };
+
+    let blast = 0;
+    for (const el of Array.from(found)) blast += el.querySelectorAll("*").length + 1;
+    return { matches: found.length, blast };
+}
+
+export function invalidLines(query: string): string[] {
+    loadThemeSheets();
+
+    const rows: Invalidation[] = [];
+    const filter = query.trim().toLowerCase();
+
+    const unreadable = walkStyleRules((rule, from) => {
+        for (const part of topLevelParts(rule.selectorText)) {
+            const selector = part.trim();
+            const anchor = hasAnchor(selector);
+            if (!anchor) continue;
+
+            const inherited = inheritedIn(rule.style);
+            const reach = blastOf(anchor, inherited.length > 0);
+            if (!reach) continue;
+
+            rows.push({
+                from,
+                selector,
+                anchor,
+                matches: reach.matches,
+                blast: reach.blast,
+                inherited,
+                hover: /:hover|:focus|:active/.test(anchor)
+            });
+        }
+    });
+
+    if (!rows.length) {
+        return [
+            "no :has() rule is loaded, so nothing here can invalidate wide",
+            "",
+            ...(unreadable.length ? ["these sheets threw when read, a different origin:", "", ...unreadable.map(n => `  ${n}`)] : [])
+        ];
+    }
+
+    const shown = rows
+        .filter(row => !filter || `${row.from} ${row.selector}`.toLowerCase().includes(filter))
+        .sort((a, b) => b.blast - a.blast);
+
+    const rooted = rows.filter(row => /^(:root|html|body)\b/.test(row.anchor));
+    const onHover = rows.filter(row => row.hover);
+    const worst = shown[0];
+
+    const out = [
+        `${rows.length} :has() rules loaded, ${rows.filter(r => r.inherited.length).length} of them set something inherited`,
+        `${rooted.length} anchored at the document root, ${onHover.length} also keyed on hover or focus`,
+        "",
+        worst
+            ? `worst reaches ${worst.blast} elements each time its answer changes`
+            : "nothing matches that filter",
+        "",
+        "elements  matches  sets                        rule",
+        "-".repeat(74)
+    ];
+
+    for (const row of shown.slice(0, 25)) {
+        const sets = row.inherited.length
+            ? `${row.inherited.slice(0, 2).join(" ")}${row.inherited.length > 2 ? ` +${row.inherited.length - 2}` : ""}`
+            : "nothing inherited";
+
+        out.push(
+            `${String(row.blast).padStart(8)}  ${String(row.matches).padStart(7)}  ${sets.slice(0, 26).padEnd(26)}  ${row.from}`,
+            `          ${row.anchor.slice(0, 62)}${row.hover ? "   <- rechecked on every mouse move" : ""}`
+        );
+    }
+
+    out.push(
+        "",
+        "elements is what recomputes when the :has() answer flips. a rule setting an",
+        "inherited property or a custom property drags every descendant with it, so the",
+        "number is the subtree; anything else stops at the element itself.",
+        "",
+        "the fix for a big one is to move the :has() down onto the smallest element that",
+        "can carry it, and to write the real property rather than a variable others read."
+    );
+
+    if (unreadable.length) out.push("", `not counted, a different origin: ${unreadable.join(", ")}`);
+
+    return out;
 }

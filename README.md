@@ -27,6 +27,10 @@ Reload Discord and turn on **ProbeDeck**.
 in the corner. Once it is open, click a tab, press a number from 1 to 9, or use the left
 and right arrows.
 
+The lenses that take a query put the caret straight in the box, which means the box owns
+the arrows and the digits and there is no key left to change lens with. Tab is that key:
+it steps to the next lens, Shift+Tab to the previous, and it keeps whatever you had typed.
+
 `Ctrl+Alt+P` and `Ctrl+Alt+R` still work. F keys are the better choice because they carry
 no character, so Windows never runs them through its AltGr translation and nothing can
 leak into the message box behind the panel. The exception is if something else on your
@@ -77,6 +81,12 @@ loaded, triages them on shape, times the worst forty properly, and lists them wo
 with the stylesheet each came from. That last column is the point: it tells you where to
 go and fix it. Give it a selector instead and it does the same for that one alone.
 
+Your themes are in that ranking even though Equicord loads them over `vencord://`, which
+counts as a different origin and normally hides their rules. The lens reads the files over
+Equicord's own file API instead. The first sweep runs before they arrive, so it says so and
+repaints once they are in. Remote themes served from a URL stay out of reach, and the lens
+names every sheet it could not read rather than quietly leaving it out of the total.
+
 **audit** sweeps for overlapping panels and seams.
 
 **diff** watches a set of landmark selectors and tells you which class names changed, which
@@ -121,6 +131,16 @@ name.
 **perf** is frame timing. **tasks** records main thread blocks over a threshold you set.
 **churn** watches how much DOM is being created and destroyed. **boot** shows how long each
 startup milestone took.
+
+**tasks** also says where the time went, which is the part that turns a number into
+something you can act on. It splits each slow frame into named script, work before paint
+that no script claimed, requestAnimationFrame callbacks, and style through layout to paint,
+then ranks the listeners and callbacks by total time held rather than by the single worst
+frame. A handler firing two hundred times is what ruins an app, not the one big hitch.
+
+Read the split before the ranking. If script is a small share, no amount of staring at the
+named functions will help, and a frame that is slow with no script and no paint work is
+usually waiting on the compositor rather than computing anything.
 
 ## Things worth knowing
 
