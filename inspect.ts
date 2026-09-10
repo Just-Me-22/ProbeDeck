@@ -362,8 +362,22 @@ export function selectors(el: Element): string[] {
  *  you which ones actually reach a given element. this walks the stylesheets for every
  *  custom property declared on this element or anything above it, then asks the
  *  computed style what each one resolves to here. */
+/** anything not served off discord's own bundle is a file you can edit: a theme, a
+ *  theme link, quickcss, a plugin's stylesheet. */
+const DISCORD_SHEET = /discord(app)?\.com\/assets\//i;
+
+function referenced(text: string, into: Set<string>) {
+    const find = /var\(\s*(--[\w-]+)/g;
+    let hit: RegExpExecArray | null;
+    while ((hit = find.exec(text))) into.add(hit[1]);
+}
+
 export function vars(el: Element): string[] {
     const names = new Set<string>();
+    /** declared by a file you can edit */
+    const yours = new Set<string>();
+    /** reached for by a rule that lands on this element, discord's own included */
+    const inPlay = new Set<string>();
     let blocked = 0;
 
     const chain: Element[] = [];
@@ -377,6 +391,8 @@ export function vars(el: Element): string[] {
             blocked++;
             continue;
         }
+
+        const local = !sheet.href || !DISCORD_SHEET.test(sheet.href);
 
         for (const rule of Array.from(rules)) {
             const styleRule = rule as CSSStyleRule;
@@ -399,8 +415,12 @@ export function vars(el: Element): string[] {
 
             for (let i = 0; i < styleRule.style.length; i++) {
                 const prop = styleRule.style[i];
-                if (prop.startsWith("--")) names.add(prop);
+                if (!prop.startsWith("--")) continue;
+
+                names.add(prop);
+                if (local) yours.add(prop);
             }
+            referenced(styleRule.style.cssText, inPlay);
         }
     }
 
@@ -408,18 +428,32 @@ export function vars(el: Element): string[] {
         return ["nothing declares a custom property that reaches this element", ...(blocked ? [`${blocked} stylesheets could not be read`] : [])];
     }
 
+    // an inline style is where discord names the token it is actually using
+    referenced((el as HTMLElement).getAttribute("style") ?? "", inPlay);
+
+    // discord ships several thousand generated scale tokens that reach every element.
+    // listing them all buried the handful that matter and made copy unusable, so the
+    // list is now what you can edit plus what these rules actually reach for.
+    const worth = [...names].filter(name => yours.has(name) || inPlay.has(name)).sort();
+    const buried = names.size - worth.length;
+
     const cs = getComputedStyle(el as HTMLElement);
     const rows: string[] = [];
     const empty: string[] = [];
 
-    for (const name of [...names].sort()) {
+    for (const name of worth) {
         const value = cs.getPropertyValue(name).trim();
         if (value) rows.push(`${name.padEnd(38)}${value}`);
         else empty.push(name);
     }
 
-    const out = [`${rows.length} resolve here, out of ${names.size} that reach it`, ""];
+    const out = [`${rows.length} shown: the ones you can edit, plus the tokens these rules reach for`, ""];
     out.push(...rows);
+
+    if (buried) {
+        out.push("", `${buried} of discord's own generated scales also reach here and are left out.`);
+        out.push("name one in the css lens to see its value.");
+    }
 
     if (empty.length) {
         out.push("", `declared somewhere above but empty here: ${empty.slice(0, 12).join(", ")}${empty.length > 12 ? ` and ${empty.length - 12} more` : ""}`);

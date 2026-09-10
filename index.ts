@@ -674,7 +674,7 @@ function onInspectClick(e: MouseEvent) {
         ...(contrastLines.length
             ? [...rule("CONTRAST  (text against whatever actually paints behind it)"), ...contrastLines]
             : []),
-        ...rule("VARIABLES  (every custom property that reaches this element)"),
+        ...rule("VARIABLES  (the ones you can edit, plus the tokens in play here)"),
         ...vars(el),
         ...rule("LAYOUT  (how the parent is placing it)"),
         ...layout(el),
